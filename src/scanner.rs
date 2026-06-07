@@ -1,0 +1,274 @@
+// 进程扫描与 CPU 亲和性设置
+//
+// 主要流程：
+// 1. 扫描 /proc 找到所有进程
+// 2. 读取 /proc/<pid>/cmdline 获取包名
+// 3. 遍历 /proc/<pid>/task/<tid>/comm 获取线程名
+// 4. 通过 rules::classify_thread 识别线程角色
+// 5. 通过 sched_setaffinity 绑核
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+
+use crate::rules::{classify_thread, CoreTarget, detect_engine};
+use crate::topo::CpuTopology;
+use crate::config::UserConfig;
+
+/// 已处理的线程缓存，避免重复设置
+#[derive(Default)]
+pub struct ProcCache {
+    /// 上一轮已处理的 tid 集合
+    pub seen_tids: HashSet<i32>,
+    /// 上一轮扫描的 pid 集合（用于检测进程退出）
+    pub known_pids: HashSet<i32>,
+    /// pid -> 包名
+    pub pid_pkg: HashMap<i32, String>,
+}
+
+impl ProcCache {
+    pub fn clear(&mut self) {
+        self.seen_tids.clear();
+        self.known_pids.clear();
+        self.pid_pkg.clear();
+    }
+}
+
+/// 读取进程的包名（从 cmdline）
+fn read_cmdline(pid: i32) -> Option<String> {
+    let path = format!("/proc/{}/cmdline", pid);
+    let content = fs::read(&path).ok()?;
+    // cmdline 以 \0 分隔，取第一段
+    let end = content.iter().position(|&b| b == 0).unwrap_or(content.len());
+    let raw = std::str::from_utf8(&content[..end]).ok()?;
+    // 去掉路径前缀，取最后一段
+    let name = raw.rsplit('/').next().unwrap_or(raw);
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// 读取线程名（从 /proc/<pid>/task/<tid>/comm）
+fn read_comm(pid: i32, tid: i32) -> Option<String> {
+    let path = format!("/proc/{}/task/{}/comm", pid, tid);
+    let content = fs::read_to_string(&path).ok()?;
+    Some(content.trim().to_string())
+}
+
+/// 将 CoreTarget 解析为实际的 cpu_set（cpu 编号列表）
+fn target_to_cores<'a>(target: CoreTarget, topo: &'a CpuTopology) -> &'a [u32] {
+    match target {
+        CoreTarget::Prime => &topo.prime,
+        CoreTarget::Big => &topo.big,
+        CoreTarget::BigAndPrime => {
+            // BigAndPrime 需要合并，这里返回 big（主函数里特殊处理）
+            &topo.big
+        }
+        CoreTarget::Little => &topo.little,
+        CoreTarget::Default => &topo.all,
+    }
+}
+
+/// 设置线程 CPU 亲和性（通过 sched_setaffinity 系统调用）
+fn set_affinity(tid: i32, cores: &[u32]) -> bool {
+    if cores.is_empty() {
+        return false;
+    }
+    // 构建 cpu_set_t（128字节 = 1024 bit，支持最多1024核）
+    let mut cpu_set = [0u8; 128];
+    for &cpu in cores {
+        if cpu < 1024 {
+            cpu_set[(cpu / 8) as usize] |= 1 << (cpu % 8);
+        }
+    }
+    let ret = unsafe {
+        libc_sched_setaffinity(tid, 128, cpu_set.as_ptr())
+    };
+    ret == 0
+}
+
+/// sched_setaffinity 系统调用封装
+#[cfg(target_arch = "aarch64")]
+unsafe fn libc_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32 {
+    let ret: i64;
+    std::arch::asm!(
+        "svc #0",
+        in("x8") 122i64, // __NR_sched_setaffinity on aarch64
+        in("x0") pid as i64,
+        in("x1") cpusetsize as i64,
+        in("x2") mask as i64,
+        lateout("x0") ret,
+        options(nostack)
+    );
+    ret as i32
+}
+
+#[cfg(target_arch = "arm")]
+unsafe fn libc_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32 {
+    let ret: i32;
+    std::arch::asm!(
+        "swi #0",
+        in("r7") 241i32, // __NR_sched_setaffinity on arm32
+        in("r0") pid,
+        in("r1") cpusetsize as i32,
+        in("r2") mask as i32,
+        lateout("r0") ret,
+        options(nostack)
+    );
+    ret
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+unsafe fn libc_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32 {
+    // 非 ARM 平台（开发机上编译测试用），通过 libc
+    extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+    }
+    sched_setaffinity(pid, cpusetsize, mask)
+}
+
+/// 一次完整扫描：找到所有进程的线程，识别并绑核
+pub fn scan_and_apply(
+    topo: &CpuTopology,
+    config: &UserConfig,
+    cache: &mut ProcCache,
+) {
+    let proc_dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let mut new_pids: HashSet<i32> = HashSet::new();
+    let mut new_tids: HashSet<i32> = HashSet::new();
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // 只处理数字目录（pid）
+        let pid: i32 = match name_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        new_pids.insert(pid);
+
+        // 获取包名（优先用缓存）
+        let pkg = if let Some(p) = cache.pid_pkg.get(&pid) {
+            p.clone()
+        } else {
+            match read_cmdline(pid) {
+                Some(p) => {
+                    cache.pid_pkg.insert(pid, p.clone());
+                    p
+                }
+                None => continue,
+            }
+        };
+
+        // 检查是否是新进程（或配置更新后需要重新处理）
+        let is_new_proc = !cache.known_pids.contains(&pid);
+
+        // 扫描该进程的所有线程
+        let task_path = format!("/proc/{}/task", pid);
+        let task_dir = match fs::read_dir(&task_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let mut thread_names: Vec<String> = Vec::new();
+
+        // 先收集所有线程名，用于引擎检测
+        for tid_entry in task_dir.flatten() {
+            let tid_name = tid_entry.file_name();
+            let tid_str = tid_name.to_string_lossy();
+            let tid: i32 = match tid_str.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            if let Some(comm) = read_comm(pid, tid) {
+                thread_names.push(comm);
+            }
+            new_tids.insert(tid);
+        }
+
+        if thread_names.is_empty() {
+            continue;
+        }
+
+        let engine = detect_engine(&thread_names);
+
+        // 再次扫描并应用亲和性
+        let task_dir2 = match fs::read_dir(&task_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        for tid_entry in task_dir2.flatten() {
+            let tid_name = tid_entry.file_name();
+            let tid_str = tid_name.to_string_lossy();
+            let tid: i32 = match tid_str.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            // 已处理过且不是新进程，跳过
+            if cache.seen_tids.contains(&tid) && !is_new_proc {
+                continue;
+            }
+
+            let comm = match read_comm(pid, tid) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // 查找绑核目标：优先用户覆盖 > 内置规则
+            let target = config.get_app_override(&pkg, &comm)
+                .or_else(|| config.get_override(&comm))
+                .unwrap_or_else(|| classify_thread(&comm));
+
+            if target == CoreTarget::Default {
+                continue;
+            }
+
+            // 解析目标核心
+            let cores: Vec<u32> = match target {
+                CoreTarget::BigAndPrime => {
+                    let mut c = topo.big.clone();
+                    c.extend_from_slice(&topo.prime);
+                    c
+                }
+                CoreTarget::Prime => topo.prime.clone(),
+                CoreTarget::Big => topo.big.clone(),
+                CoreTarget::Little => topo.little.clone(),
+                CoreTarget::Default => continue,
+            };
+
+            if cores.is_empty() {
+                continue;
+            }
+
+            let cpuset_str = CpuTopology::cores_to_cpuset(&cores);
+            let ok = set_affinity(tid, &cores);
+
+            if config.settings.log_level == "debug" {
+                eprintln!(
+                    "[affinity] pid={} pkg={} tid={} comm={} engine={:?} -> {} (cores={}) {}",
+                    pid, pkg, tid, comm, engine, 
+                    format!("{:?}", target).to_lowercase(),
+                    cpuset_str,
+                    if ok { "✓" } else { "✗" }
+                );
+            }
+        }
+    }
+
+    // 更新缓存
+    cache.known_pids = new_pids;
+    cache.seen_tids = new_tids;
+
+    // 清理退出进程的包名缓存
+    cache.pid_pkg.retain(|pid, _| cache.known_pids.contains(pid));
+}
