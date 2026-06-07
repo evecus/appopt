@@ -24,9 +24,6 @@ jobs:
           - target: aarch64-linux-android
             arch_dir: arm64-v8a
             linker: aarch64-linux-android26-clang
-          - target: armv7-linux-androideabi
-            arch_dir: armeabi-v7a
-            linker: armv7a-linux-androideabi26-clang
           - target: x86_64-linux-android
             arch_dir: x86_64
             linker: x86_64-linux-android26-clang
@@ -137,13 +134,11 @@ jobs:
 
           mkdir -p "${MODDIR}/META-INF/com/google/android"
           mkdir -p "${MODDIR}/bin/arm64-v8a"
-          mkdir -p "${MODDIR}/bin/armeabi-v7a"
           mkdir -p "${MODDIR}/bin/x86_64"
           mkdir -p "${MODDIR}/bin/x86"
 
           # 复制编译好的二进制
           cp artifacts/appopt-arm64-v8a/appopt   "${MODDIR}/bin/arm64-v8a/appopt"   || echo "WARN: arm64 binary missing"
-          cp artifacts/appopt-armeabi-v7a/appopt "${MODDIR}/bin/armeabi-v7a/appopt" || echo "WARN: armeabi binary missing"
           cp artifacts/appopt-x86_64/appopt      "${MODDIR}/bin/x86_64/appopt"      || echo "WARN: x86_64 binary missing"
           cp artifacts/appopt-x86/appopt         "${MODDIR}/bin/x86/appopt"         || echo "WARN: x86 binary missing"
           chmod +x "${MODDIR}"/bin/*/appopt 2>/dev/null || true
