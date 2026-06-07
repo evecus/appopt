@@ -1,0 +1,398 @@
+name: Build & Package AppOpt-RS
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: '版本后缀（留空则用 git hash）'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  # Android NDK 版本（与 Android API 28+ 兼容）
+  NDK_VERSION: r27c
+  # 最低支持的 Android API level
+  MIN_SDK: 26
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            arch_dir: arm64-v8a
+            linker: aarch64-linux-android${{ env.MIN_SDK }}-clang
+          - target: armv7-linux-androideabi
+            arch_dir: armeabi-v7a
+            linker: armv7a-linux-androideabi${{ env.MIN_SDK }}-clang
+          - target: x86_64-linux-android
+            arch_dir: x86_64
+            linker: x86_64-linux-android${{ env.MIN_SDK }}-clang
+          - target: i686-linux-android
+            arch_dir: x86
+            linker: i686-linux-android${{ env.MIN_SDK }}-clang
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Configure Cargo for cross-compilation
+        run: |
+          NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << EOF
+          [target.${{ matrix.target }}]
+          linker = "${TOOLCHAIN}/${{ matrix.linker }}"
+          EOF
+
+          echo "NDK toolchain: ${TOOLCHAIN}"
+          ls "${TOOLCHAIN}" | grep clang | head -5
+
+      - name: Build release binary
+        run: |
+          cargo build \
+            --release \
+            --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          # 找到对应架构的 strip 工具
+          case "${{ matrix.target }}" in
+            aarch64-linux-android)
+              STRIP="${TOOLCHAIN}/../../../bin/llvm-strip" ;;
+            armv7-linux-androideabi)
+              STRIP="${TOOLCHAIN}/../../../bin/llvm-strip" ;;
+            *)
+              STRIP="${TOOLCHAIN}/../../../bin/llvm-strip" ;;
+          esac
+
+          BINARY="target/${{ matrix.target }}/release/appopt"
+          if [ -f "${BINARY}" ]; then
+            ${STRIP} "${BINARY}" || true
+            ls -lh "${BINARY}"
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appopt-${{ matrix.arch_dir }}
+          path: target/${{ matrix.target }}/release/appopt
+          retention-days: 7
+
+  package:
+    name: Package Magisk Module
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [ -n "${{ github.event.inputs.version_suffix }}" ]; then
+            VERSION="${{ github.event.inputs.version_suffix }}"
+          else
+            SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+            VERSION="dev-${SHORT_SHA}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VERSION}"
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Build Magisk module zip
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          MODULE_ID="AppOpt_RS"
+
+          # 创建模块目录结构
+          MODDIR="module_build"
+          mkdir -p "${MODDIR}/META-INF/com/google/android"
+          mkdir -p "${MODDIR}/bin/arm64-v8a"
+          mkdir -p "${MODDIR}/bin/armeabi-v7a"
+          mkdir -p "${MODDIR}/bin/x86_64"
+          mkdir -p "${MODDIR}/bin/x86"
+
+          # 复制编译好的二进制
+          cp artifacts/appopt-arm64-v8a/appopt   "${MODDIR}/bin/arm64-v8a/appopt"   || echo "arm64 binary missing"
+          cp artifacts/appopt-armeabi-v7a/appopt "${MODDIR}/bin/armeabi-v7a/appopt" || echo "armeabi binary missing"
+          cp artifacts/appopt-x86_64/appopt      "${MODDIR}/bin/x86_64/appopt"      || echo "x86_64 binary missing"
+          cp artifacts/appopt-x86/appopt         "${MODDIR}/bin/x86/appopt"         || echo "x86 binary missing"
+
+          chmod +x "${MODDIR}"/bin/*/appopt 2>/dev/null || true
+
+          # module.prop
+          cat > "${MODDIR}/module.prop" << EOF
+          id=${MODULE_ID}
+          name=AppOpt-RS（智能线程优化）
+          version=v${VERSION}
+          versionCode=$(echo ${VERSION} | tr -cd '0-9' | head -c6)
+          author=AppOpt-RS Contributors
+          description=智能线程绑核优化，自动识别CPU拓扑与线程角色，无需配置文件。基于 Rust 编写。
+          EOF
+
+          # META-INF/com/google/android/update-binary（标准 Magisk 安装脚本）
+          cat > "${MODDIR}/META-INF/com/google/android/update-binary" << 'UBEOF'
+          #!/sbin/sh
+
+          umask 022
+
+          TMPDIR=/dev/tmp
+          rm -rf $TMPDIR 2>/dev/null
+          mkdir -p $TMPDIR
+
+          ui_print() { echo "$1"; }
+
+          require_new_magisk() {
+            ui_print "*******************************"
+            ui_print " Please install Magisk v20.4+!"
+            ui_print "*******************************"
+            exit 1
+          }
+
+          SKIPUNZIP=1
+
+          # 加载 Magisk util_functions
+          if [ ! -f /data/adb/magisk/util_functions.sh ]; then
+            require_new_magisk
+          fi
+          . /data/adb/magisk/util_functions.sh
+          [ "$MAGISK_VER_CODE" -lt 20400 ] && require_new_magisk
+
+          # 展开模块文件
+          ui_print "- 解压模块文件..."
+          unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH"
+
+          # 检测设备 ABI 并选择对应二进制
+          ABI=$(getprop ro.product.cpu.abi)
+          ABI2=$(getprop ro.product.cpu.abi2)
+
+          ui_print "- 设备 ABI: ${ABI}"
+
+          select_binary() {
+            if   echo "$ABI" | grep -q "arm64";  then echo "arm64-v8a"
+            elif echo "$ABI" | grep -q "x86_64"; then echo "x86_64"
+            elif echo "$ABI" | grep -q "x86";    then echo "x86"
+            elif echo "$ABI" | grep -q "armeabi";then echo "armeabi-v7a"
+            else echo "arm64-v8a"  # 默认 arm64
+            fi
+          }
+
+          ARCH_DIR=$(select_binary)
+          ui_print "- 使用架构目录: ${ARCH_DIR}"
+
+          # 将对应架构的二进制放到模块根目录
+          if [ -f "${MODPATH}/bin/${ARCH_DIR}/appopt" ]; then
+            cp "${MODPATH}/bin/${ARCH_DIR}/appopt" "${MODPATH}/appopt"
+            chmod 755 "${MODPATH}/appopt"
+            ui_print "- 二进制安装成功"
+          else
+            ui_print "! 未找到 ${ARCH_DIR} 架构的二进制"
+            abort "! 安装失败"
+          fi
+
+          # 清理多余的 bin 目录
+          rm -rf "${MODPATH}/bin"
+
+          # 设置权限
+          set_perm_recursive "$MODPATH" root root 0755 0644
+          set_perm "${MODPATH}/appopt"   root root 0755
+          set_perm "${MODPATH}/service.sh" root root 0755
+
+          ui_print "- AppOpt-RS 安装完成"
+          ui_print "- 重启后自动运行"
+          UBEOF
+
+          chmod +x "${MODDIR}/META-INF/com/google/android/update-binary"
+
+          # updater-script（仅声明，实际逻辑在 update-binary）
+          echo "#MAGISK" > "${MODDIR}/META-INF/com/google/android/updater-script"
+
+          # service.sh（开机启动守护进程）
+          cat > "${MODDIR}/service.sh" << 'SVCEOF'
+          #!/system/bin/sh
+
+          # 等待系统启动完成
+          wait_boot() {
+            local i=12
+            until [ "$(getprop sys.boot_completed)" = "1" ] || [ $i -le 0 ]; do
+              i=$((i - 1))
+              sleep 10
+            done
+          }
+
+          wait_boot
+
+          MODULE_DIR="${0%/*}"
+          BINARY="${MODULE_DIR}/appopt"
+          LOG_FILE="${MODULE_DIR}/appopt.log"
+          CONFIG_FILE="${MODULE_DIR}/custom.toml"
+
+          # 杀掉旧实例
+          killall -15 appopt 2>/dev/null
+          sleep 1
+
+          # 检查二进制存在
+          if [ ! -f "${BINARY}" ]; then
+            echo "[$(date)] appopt binary not found" >> "${LOG_FILE}"
+            exit 1
+          fi
+
+          chmod 755 "${BINARY}"
+
+          # 清空旧日志（保留最近一次）
+          : > "${LOG_FILE}"
+
+          # 构建启动参数
+          ARGS=""
+          [ -f "${CONFIG_FILE}" ] && ARGS="${ARGS} -c ${CONFIG_FILE}"
+
+          # 后台运行
+          nohup "${BINARY}" ${ARGS} >> "${LOG_FILE}" 2>&1 &
+
+          echo "[$(date)] AppOpt-RS 启动 PID=$!" >> "${LOG_FILE}"
+          SVCEOF
+
+          chmod +x "${MODDIR}/service.sh"
+
+          # uninstall.sh
+          cat > "${MODDIR}/uninstall.sh" << 'UNEOF'
+          #!/system/bin/sh
+          killall -15 appopt 2>/dev/null
+          UNEOF
+          chmod +x "${MODDIR}/uninstall.sh"
+
+          # customize.sh（安装时检查）
+          cat > "${MODDIR}/customize.sh" << 'CUSEOF'
+          # AppOpt-RS 安装检查
+          ui_print "**************************************************"
+          ui_print "  AppOpt-RS - 智能线程绑核优化"
+          ui_print "**************************************************"
+
+          # 检查 /sys/devices/system/cpu/present
+          if [ ! -f "/sys/devices/system/cpu/present" ]; then
+            abort "! 无法读取 CPU 信息，安装中止"
+          fi
+
+          CPU_PRESENT=$(cat /sys/devices/system/cpu/present)
+          ui_print "- CPU 核心: ${CPU_PRESENT}"
+
+          # 读取并展示 CPU 频率信息
+          for i in 0 1 2 3 4 5 6 7; do
+            FREQ_PATH="/sys/devices/system/cpu/cpu${i}/cpufreq/cpuinfo_max_freq"
+            if [ -f "${FREQ_PATH}" ]; then
+              FREQ=$(cat "${FREQ_PATH}")
+              FREQ_MHZ=$((FREQ / 1000))
+              ui_print "  CPU${i}: ${FREQ_MHZ} MHz"
+            fi
+          done
+
+          ui_print "- 安装完成后重启设备生效"
+          CUSEOF
+
+          # 示例配置文件（可选）
+          cat > "${MODDIR}/custom.toml.example" << 'CFGEOF'
+          # AppOpt-RS 用户覆盖配置（可选）
+          # 将此文件重命名为 custom.toml 后生效
+          # 不修改时程序使用内置智能规则，无需任何配置
+
+          # [settings]
+          # scan_interval_ms = 2000  # 扫描间隔（毫秒）
+          # log_level = "info"       # 日志级别: debug / info
+
+          # [override]
+          # 按线程名全局覆盖（对所有 App 生效）
+          # 可选值: "prime" / "big" / "little" / "default"
+          # "RenderThread" = "prime"
+          # "MyCustomThread" = "big"
+
+          # [override_app."com.example.game"]
+          # 针对特定包名覆盖
+          # "GameMainThread" = "prime"
+          CFGEOF
+
+          # 打包
+          cd "${MODDIR}"
+          ZIP_NAME="AppOpt-RS-v${VERSION}.zip"
+          zip -r9 "../${ZIP_NAME}" . -x "*.DS_Store" -x "__MACOSX/*"
+          cd ..
+
+          ls -lh "${ZIP_NAME}"
+          echo "Module zip: ${ZIP_NAME}"
+          echo "zip_name=${ZIP_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppOpt-RS-module-${{ steps.version.outputs.version }}
+          path: AppOpt-RS-v*.zip
+          retention-days: 30
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AppOpt-RS-v*.zip
+          generate_release_notes: true
+          body: |
+            ## AppOpt-RS ${{ steps.version.outputs.version }}
+
+            ### 功能
+            - 自动识别 CPU 拓扑（Prime/Big/Little）
+            - 自动识别线程角色（Unity/Unreal/Flutter/Chromium/原生）
+            - 智能绑核，无需配置文件
+            - 可选 `custom.toml` 覆盖特定规则
+
+            ### 安装
+            通过 Magisk / KernelSU / APatch 刷入 zip 包
+
+            ### 支持架构
+            - arm64-v8a（主流旗舰）
+            - armeabi-v7a（32位）
+            - x86_64 / x86（模拟器）
