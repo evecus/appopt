@@ -10,6 +10,7 @@ mod topo;
 mod rules;
 mod config;
 mod scanner;
+mod glob;
 
 use std::thread;
 use std::time::Duration;

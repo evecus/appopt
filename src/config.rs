@@ -10,6 +10,7 @@
 // # 按线程名覆盖，适用于所有 App
 // "RenderThread" = "prime"
 // "MyCustomThread" = "big"
+// # 可选值：prime / big / big+prime / little+big / little / default
 //
 // [override_app."com.example.game"]
 // # 仅针对特定包名覆盖
@@ -97,6 +98,7 @@ fn parse_target(s: &str) -> Option<CoreTarget> {
         "big" => Some(CoreTarget::Big),
         "big+prime" | "bigandprime" => Some(CoreTarget::BigAndPrime),
         "little" => Some(CoreTarget::Little),
+        "little+big" | "littleandbig" => Some(CoreTarget::LittleAndBig),
         "default" | "none" => Some(CoreTarget::Default),
         _ => {
             eprintln!("[config] 未知核心类型: {}", s);

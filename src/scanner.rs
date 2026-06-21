@@ -57,16 +57,23 @@ fn read_comm(pid: i32, tid: i32) -> Option<String> {
 }
 
 /// 将 CoreTarget 解析为实际的 cpu_set（cpu 编号列表）
-fn target_to_cores<'a>(target: CoreTarget, topo: &'a CpuTopology) -> &'a [u32] {
+/// 供「custom.toml 覆盖」与「内置启发式规则」两条路径共用
+fn resolve_target_cores(target: CoreTarget, topo: &CpuTopology) -> Vec<u32> {
     match target {
-        CoreTarget::Prime => &topo.prime,
-        CoreTarget::Big => &topo.big,
         CoreTarget::BigAndPrime => {
-            // BigAndPrime 需要合并，这里返回 big（主函数里特殊处理）
-            &topo.big
+            let mut c = topo.big.clone();
+            c.extend_from_slice(&topo.prime);
+            c
         }
-        CoreTarget::Little => &topo.little,
-        CoreTarget::Default => &topo.all,
+        CoreTarget::LittleAndBig => {
+            let mut c = topo.little.clone();
+            c.extend_from_slice(&topo.big);
+            c
+        }
+        CoreTarget::Prime => topo.prime.clone(),
+        CoreTarget::Big => topo.big.clone(),
+        CoreTarget::Little => topo.little.clone(),
+        CoreTarget::Default => Vec::new(),
     }
 }
 
@@ -170,6 +177,11 @@ pub fn scan_and_apply(
         // 检查是否是新进程（或配置更新后需要重新处理）
         let is_new_proc = !cache.known_pids.contains(&pid);
 
+        // pkg 可能形如 "包名" 或 "包名:子进程名"（Android 多进程应用的真实
+        // cmdline 就是这个格式）。custom.toml 的 override_app 按纯包名配置，
+        // 这里取冒号前半部分用于匹配。
+        let base_pkg = pkg.split(':').next().unwrap_or(&pkg);
+
         // 扫描该进程的所有线程
         let task_path = format!("/proc/{}/task", pid);
         let task_dir = match fs::read_dir(&task_path) {
@@ -224,27 +236,25 @@ pub fn scan_and_apply(
                 None => continue,
             };
 
-            // 查找绑核目标：优先用户覆盖 > 内置规则
-            let target = config.get_app_override(&pkg, &comm)
+            // 查找绑核目标，优先级：
+            //   1) custom.toml 用户覆盖（按包名或全局线程名）
+            //   2) 内置启发式规则（rules.rs，按 Prime/Big/Little/LittleAndBig
+            //      角色分类，规则表是对大量真实 App 线程命名数据统计挖掘得出的）
+            let mut source = "builtin";
+            let cores: Vec<u32>;
+
+            if let Some(target) = config.get_app_override(base_pkg, &comm)
                 .or_else(|| config.get_override(&comm))
-                .unwrap_or_else(|| classify_thread(&comm));
-
-            if target == CoreTarget::Default {
-                continue;
-            }
-
-            // 解析目标核心
-            let cores: Vec<u32> = match target {
-                CoreTarget::BigAndPrime => {
-                    let mut c = topo.big.clone();
-                    c.extend_from_slice(&topo.prime);
-                    c
+            {
+                source = "toml";
+                cores = resolve_target_cores(target, topo);
+            } else {
+                let target = classify_thread(&comm);
+                if target == CoreTarget::Default {
+                    continue;
                 }
-                CoreTarget::Prime => topo.prime.clone(),
-                CoreTarget::Big => topo.big.clone(),
-                CoreTarget::Little => topo.little.clone(),
-                CoreTarget::Default => continue,
-            };
+                cores = resolve_target_cores(target, topo);
+            }
 
             if cores.is_empty() {
                 continue;
@@ -255,9 +265,9 @@ pub fn scan_and_apply(
 
             if config.settings.log_level == "debug" {
                 eprintln!(
-                    "[affinity] pid={} pkg={} tid={} comm={} engine={:?} -> {} (cores={}) {}",
-                    pid, pkg, tid, comm, engine, 
-                    format!("{:?}", target).to_lowercase(),
+                    "[affinity] pid={} pkg={} tid={} comm={} engine={:?} src={} -> cores={} {}",
+                    pid, pkg, tid, comm, engine,
+                    source,
                     cpuset_str,
                     if ok { "✓" } else { "✗" }
                 );
