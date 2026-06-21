@@ -78,9 +78,10 @@ fn resolve_target_cores(target: CoreTarget, topo: &CpuTopology) -> Vec<u32> {
 }
 
 /// 设置线程 CPU 亲和性（通过 sched_setaffinity 系统调用）
-fn set_affinity(tid: i32, cores: &[u32]) -> bool {
+/// 返回原始结果：0 表示成功，负数为 -errno（失败原因）
+fn set_affinity(tid: i32, cores: &[u32]) -> i32 {
     if cores.is_empty() {
-        return false;
+        return -22; // EINVAL
     }
     // 构建 cpu_set_t（128字节 = 1024 bit，支持最多1024核）
     let mut cpu_set = [0u8; 128];
@@ -89,10 +90,23 @@ fn set_affinity(tid: i32, cores: &[u32]) -> bool {
             cpu_set[(cpu / 8) as usize] |= 1 << (cpu % 8);
         }
     }
-    let ret = unsafe {
+    unsafe {
         libc_sched_setaffinity(tid, 128, cpu_set.as_ptr())
-    };
-    ret == 0
+    }
+}
+
+/// 把常见 errno 转成可读名称，方便从 debug 日志直接判断失败原因：
+/// - EPERM/EACCES：权限不足，常见于 SELinux 拒绝跨域 setsched（需要 sepolicy.rule）
+/// - ESRCH：线程在两次扫描间已经退出（无害，下一轮会跳过这个已消失的线程）
+/// - EINVAL：参数非法（理论上不应出现，出现说明有 bug）
+fn errno_name(ret: i32) -> &'static str {
+    match -ret {
+        1 => "EPERM",
+        3 => "ESRCH",
+        13 => "EACCES",
+        22 => "EINVAL",
+        _ => "?",
+    }
 }
 
 /// sched_setaffinity 系统调用封装
@@ -129,10 +143,18 @@ unsafe fn libc_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -
 #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
 unsafe fn libc_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32 {
     // 非 ARM 平台（开发机上编译测试用），通过 libc
+    // libc 的约定是返回 -1 并设置全局 errno，这里转换成跟原始 syscall
+    // 一致的 "0=成功，负数为 -errno" 约定，方便上层统一处理
     extern "C" {
         fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+        fn __errno_location() -> *mut i32;
     }
-    sched_setaffinity(pid, cpusetsize, mask)
+    let ret = sched_setaffinity(pid, cpusetsize, mask);
+    if ret == 0 {
+        0
+    } else {
+        -(*__errno_location())
+    }
 }
 
 /// 一次完整扫描：找到所有进程的线程，识别并绑核
@@ -261,16 +283,20 @@ pub fn scan_and_apply(
             }
 
             let cpuset_str = CpuTopology::cores_to_cpuset(&cores);
-            let ok = set_affinity(tid, &cores);
+            let ret = set_affinity(tid, &cores);
 
             if config.settings.log_level == "debug" {
-                eprintln!(
-                    "[affinity] pid={} pkg={} tid={} comm={} engine={:?} src={} -> cores={} {}",
-                    pid, pkg, tid, comm, engine,
-                    source,
-                    cpuset_str,
-                    if ok { "✓" } else { "✗" }
-                );
+                if ret == 0 {
+                    eprintln!(
+                        "[affinity] pid={} pkg={} tid={} comm={} engine={:?} src={} -> cores={} ✓",
+                        pid, pkg, tid, comm, engine, source, cpuset_str
+                    );
+                } else {
+                    eprintln!(
+                        "[affinity] pid={} pkg={} tid={} comm={} engine={:?} src={} -> cores={} ✗ errno={}({})",
+                        pid, pkg, tid, comm, engine, source, cpuset_str, -ret, errno_name(ret)
+                    );
+                }
             }
         }
     }
