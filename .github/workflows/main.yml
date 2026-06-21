@@ -24,12 +24,6 @@ jobs:
           - target: aarch64-linux-android
             arch_dir: arm64-v8a
             linker: aarch64-linux-android26-clang
-          - target: x86_64-linux-android
-            arch_dir: x86_64
-            linker: x86_64-linux-android26-clang
-          - target: i686-linux-android
-            arch_dir: x86
-            linker: i686-linux-android26-clang
 
     steps:
       - name: Checkout
@@ -120,7 +114,7 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Building version: ${VERSION}"
 
-      - name: Download all binaries
+      - name: Download binary artifact
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
@@ -133,15 +127,10 @@ jobs:
           MODDIR="module_build"
 
           mkdir -p "${MODDIR}/META-INF/com/google/android"
-          mkdir -p "${MODDIR}/bin/arm64-v8a"
-          mkdir -p "${MODDIR}/bin/x86_64"
-          mkdir -p "${MODDIR}/bin/x86"
 
-          # 复制编译好的二进制
-          cp artifacts/appopt-arm64-v8a/appopt   "${MODDIR}/bin/arm64-v8a/appopt"   || echo "WARN: arm64 binary missing"
-          cp artifacts/appopt-x86_64/appopt      "${MODDIR}/bin/x86_64/appopt"      || echo "WARN: x86_64 binary missing"
-          cp artifacts/appopt-x86/appopt         "${MODDIR}/bin/x86/appopt"         || echo "WARN: x86 binary missing"
-          chmod +x "${MODDIR}"/bin/*/appopt 2>/dev/null || true
+          # 复制编译好的二进制，直接放在模块根目录
+          cp artifacts/appopt-arm64-v8a/appopt "${MODDIR}/appopt"
+          chmod +x "${MODDIR}/appopt"
 
           # ---------- module.prop ----------
           cat > "${MODDIR}/module.prop" << PROPEOF
@@ -150,7 +139,7 @@ jobs:
           version=v${VERSION}
           versionCode=$(echo "${VERSION}" | tr -cd '0-9' | head -c6)
           author=AppOpt-RS Contributors
-          description=智能线程绑核优化，自动识别CPU拓扑与线程角色，无需配置文件。基于 Rust 编写。
+          description=智能线程绑核优化（仅支持 arm64-v8a 设备），自动识别CPU拓扑与线程角色（规则表基于大规模真实 App 线程命名数据统计挖掘），无需任何配置文件。基于 Rust 编写。
           PROPEOF
 
           # ---------- updater-script ----------
@@ -183,22 +172,15 @@ jobs:
           ABI=$(getprop ro.product.cpu.abi)
           ui_print "- 设备 ABI: ${ABI}"
 
-          if   echo "$ABI" | grep -q "arm64";   then ARCH_DIR="arm64-v8a"
-          elif echo "$ABI" | grep -q "x86_64";  then ARCH_DIR="x86_64"
-          elif echo "$ABI" | grep -q "x86";     then ARCH_DIR="x86"
-          else ARCH_DIR="armeabi-v7a"
-          fi
-          ui_print "- 架构: ${ARCH_DIR}"
-
-          if [ -f "${MODPATH}/bin/${ARCH_DIR}/appopt" ]; then
-            cp "${MODPATH}/bin/${ARCH_DIR}/appopt" "${MODPATH}/appopt"
-            chmod 755 "${MODPATH}/appopt"
-            ui_print "- 二进制安装成功"
-          else
-            abort "! 未找到 ${ARCH_DIR} 架构的二进制，安装失败"
+          if ! echo "$ABI" | grep -q "arm64"; then
+            abort "! 本模块仅支持 arm64-v8a 设备，当前设备不兼容"
           fi
 
-          rm -rf "${MODPATH}/bin"
+          if [ ! -f "${MODPATH}/appopt" ]; then
+            abort "! 未找到 appopt 二进制，安装失败"
+          fi
+          chmod 755 "${MODPATH}/appopt"
+          ui_print "- 二进制安装成功"
 
           set_perm_recursive "$MODPATH" root root 0755 0644
           set_perm "${MODPATH}/appopt"     root root 0755
@@ -298,7 +280,7 @@ jobs:
 
             ### 功能
             - 自动识别 CPU 拓扑（Prime / Big / Little）
-            - 自动识别线程角色（Unity / Unreal / Flutter / Chromium / 原生）
+            - 自动识别线程角色（Unity / Unreal / Flutter / Chromium / 原生），规则表基于大规模真实 App 线程命名数据统计挖掘，覆盖面远超手写经验规则
             - 智能绑核，无需配置文件
             - 可选 `custom.toml` 覆盖特定规则
 
@@ -306,6 +288,4 @@ jobs:
             通过 Magisk / KernelSU / APatch 刷入 zip 包，重启生效
 
             ### 支持架构
-            - `arm64-v8a`（主流旗舰）
-            - `armeabi-v7a`（32位）
-            - `x86_64` / `x86`（模拟器）
+            仅 `arm64-v8a`（主流旗舰机型）
