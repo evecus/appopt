@@ -244,14 +244,33 @@ pub static THREAD_RULES: &[ThreadRule] = &[
     ThreadRule::wildcard("ThreadPoolForeg*", CoreTarget::LittleAndBig),
     ThreadRule::wildcard("ThreadPoolServi*", CoreTarget::LittleAndBig),
     ThreadRule::wildcard("ThreadPool*",      CoreTarget::LittleAndBig),
+    // Java 标准线程池（Executors.newFixedThreadPool）生成的命名格式：
+    // pool-<pool_id>-thread-<thread_id>，是最常见的通用后台工作线程
+    // 必须放在所有宽泛 *Pool* 规则之前，让精确前缀优先命中
+    ThreadRule::wildcard("pool-[0-9]*-thread*", CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("#pool-[0-9]*-thread*", CoreTarget::LittleAndBig),
+    // 常见业务侧线程池（对延迟不敏感，不需要超大核）
+    ThreadRule::wildcard("onPool-worker-*",     CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("rx-pool-*",           CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("cached-pool-*",       CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("pivotal-pool-*",      CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("vrpool-*",            CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("ledThreadPool-*",     CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("*ColdPool*",          CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("*HotPool*",           CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("HadesPool*",          CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("HadesLibPool*",       CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("*ThreadPool*",        CoreTarget::LittleAndBig),
     // 音频（修正：原判纯Little）
     ThreadRule::wildcard("FMOD*",            CoreTarget::LittleAndBig),
     ThreadRule::exact("AudioTrack",          CoreTarget::LittleAndBig),
+    ThreadRule::wildcard("SoundPool*",       CoreTarget::LittleAndBig), // 音频播放池，不需要超大核
+    ThreadRule::wildcard("ijk_dash_pool_*",  CoreTarget::LittleAndBig), // ijkplayer dash流线程池
     // Unity 编曲/节拍（修正：原判纯Little）
     ThreadRule::wildcard("UnityChoreograp*", CoreTarget::LittleAndBig),
     ThreadRule::wildcard("UnityChoreo*",     CoreTarget::LittleAndBig),
     // 后台加载（修正：原判纯Little）
-    ThreadRule::low("*Loading*",        CoreTarget::LittleAndBig),
+    ThreadRule::low("*Loading*",             CoreTarget::LittleAndBig),
     ThreadRule::wildcard("Loading.*",        CoreTarget::LittleAndBig),
     ThreadRule::wildcard("FAsyncLoading*",   CoreTarget::LittleAndBig),
     ThreadRule::wildcard("CriManaDecode*",   CoreTarget::LittleAndBig),
@@ -350,6 +369,18 @@ mod tests {
         assert_eq!(classify_thread("UnityChoreographer"), CoreTarget::LittleAndBig);
         assert_eq!(classify_thread("AudioTrack"), CoreTarget::LittleAndBig);
         assert_eq!(classify_thread("ThreadPoolForeground"), CoreTarget::LittleAndBig);
+        // Java 标准线程池，不应该占用超大核
+        assert_eq!(classify_thread("pool-3-thread-1"), CoreTarget::LittleAndBig);
+        assert_eq!(classify_thread("pool-128-thread-"), CoreTarget::LittleAndBig);
+        assert_eq!(classify_thread("#pool-5-thread-"), CoreTarget::LittleAndBig);
+        // 音频播放池
+        assert_eq!(classify_thread("SoundPool_1"), CoreTarget::LittleAndBig);
+        assert_eq!(classify_thread("SoundPool_2"), CoreTarget::LittleAndBig);
+        // 美团 Hades 框架线程池
+        assert_eq!(classify_thread("HadesPool#0"), CoreTarget::LittleAndBig);
+        assert_eq!(classify_thread("HadesLibPool#1"), CoreTarget::LittleAndBig);
+        // ijkplayer dash流
+        assert_eq!(classify_thread("ijk_dash_pool_0"), CoreTarget::LittleAndBig);
     }
 
     #[test]
