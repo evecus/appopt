@@ -11,6 +11,7 @@ mod rules;
 mod config;
 mod scanner;
 mod glob;
+mod cpuset;
 
 use std::thread;
 use std::time::Duration;
@@ -115,6 +116,16 @@ fn main() {
         config_path,
         if std::path::Path::new(&config_path).exists() { "已加载" } else { "未找到，使用内置规则" }
     );
+
+    // 初始化自定义 cpuset 分组（解决后台线程被系统省电 cpuset 限核的问题）
+    // 必须在打印 topo 信息之后初始化，因为需要 topo.all_cpuset()
+    let mut cpuset_mgr = cpuset::CpusetManager::init(&topo.all_cpuset());
+    if cpuset_mgr.enabled() {
+        println!("cpuset: 已启用自定义分组（后台线程绑大核不再受系统限制）");
+    } else {
+        println!("cpuset: 未启用（/dev/cpuset 不存在或创建失败，后台线程可能因系统限制绑核失败）");
+    }
+
     println!("开始运行...");
 
     // 信号处理（SIGTERM/SIGINT 优雅退出）
@@ -127,7 +138,7 @@ fn main() {
     let mut cache = scanner::ProcCache::default();
 
     while running.load(Ordering::Relaxed) {
-        scanner::scan_and_apply(&topo, &user_config, &mut cache);
+        scanner::scan_and_apply(&topo, &user_config, &mut cpuset_mgr, &mut cache);
         thread::sleep(interval);
     }
 

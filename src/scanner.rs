@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use crate::rules::{classify_thread, CoreTarget, detect_engine};
 use crate::topo::CpuTopology;
 use crate::config::UserConfig;
+use crate::cpuset::CpusetManager;
 
 /// 已处理的线程缓存，避免重复设置
 #[derive(Default)]
@@ -161,6 +162,7 @@ unsafe fn libc_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -
 pub fn scan_and_apply(
     topo: &CpuTopology,
     config: &UserConfig,
+    cpuset_mgr: &mut CpusetManager,
     cache: &mut ProcCache,
 ) {
     let proc_dir = match fs::read_dir("/proc") {
@@ -283,6 +285,16 @@ pub fn scan_and_apply(
             }
 
             let cpuset_str = CpuTopology::cores_to_cpuset(&cores);
+
+            // 第一步：把线程移入允许这组核心的自定义 cpuset 分组
+            // 这一步解决 Android 后台省电 cpuset 限制导致的 EINVAL 问题：
+            // 系统把后台 App 的线程限制在小核组，直接调 sched_setaffinity
+            // 请求大核会被内核拒绝（线程当前 cpuset 不包含目标核心）；
+            // 换入自定义分组后，限制跟着换掉，后续的 sched_setaffinity 才能成功。
+            // CpusetManager 不可用（设备没有 /dev/cpuset）时此调用直接返回，无副作用。
+            cpuset_mgr.move_task(tid, &cpuset_str);
+
+            // 第二步：sched_setaffinity 精确绑核
             let ret = set_affinity(tid, &cores);
 
             if config.settings.log_level == "debug" {
